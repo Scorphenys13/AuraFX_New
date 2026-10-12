@@ -59,6 +59,7 @@ const props = defineProps<{
 	existingToolNames?: string[];
 	hideAskAssistant?: boolean;
 	projectId?: string;
+	forAgent?: boolean;
 	/** Resource/operation option values to hide from the form (e.g. operations the hosting runtime cannot execute). */
 	hiddenOperations?: readonly string[];
 	parameterIssues?: Record<string, string[]>;
@@ -203,8 +204,23 @@ const expressionResolveCtx = computed<ExpressionLocalResolveContext | undefined>
 	};
 });
 
+// Agents cannot use personal credentials yet. A saved selection that the
+// agent-scoped fetch no longer returns must block saving.
+const agentCredentialsLoaded = ref(false);
+const hasUnavailableAgentCredential = computed(() => {
+	if (!props.forAgent || !agentCredentialsLoaded.value) return false;
+	return Object.values(node.value?.credentials ?? {}).some(
+		(credential) => credential.id && !credentialsStore.getUsableCredentialById(credential.id),
+	);
+});
+
 const isValid = computed(() => {
-	return node.value?.name && !hasParameterIssues.value && !hasCredentialIssues.value;
+	return (
+		node.value?.name &&
+		!hasParameterIssues.value &&
+		!hasCredentialIssues.value &&
+		!hasUnavailableAgentCredential.value
+	);
 });
 
 // Provide expression resolve context for dynamic parameter loading
@@ -451,8 +467,12 @@ onMounted(async () => {
 	if (projectId) {
 		await Promise.all([
 			credentialsStore.fetchCredentialTypes(false),
-			credentialsStore.fetchUsableCredentials({ projectId }),
+			credentialsStore.fetchUsableCredentials({
+				projectId,
+				...(props.forAgent ? { forAgent: true } : {}),
+			}),
 		]);
+		agentCredentialsLoaded.value = true;
 	}
 });
 
@@ -500,6 +520,7 @@ defineExpose({ node, isValid, nodeTypeDescription, handleChangeName });
 						:readonly="props.readOnly"
 						:show-all="true"
 						:project-id="credentialProjectId"
+						:for-agent="props.forAgent"
 						:hide-issues="false"
 						:hide-ask-assistant="props.hideAskAssistant"
 						:skip-credentials-fetch="true"
