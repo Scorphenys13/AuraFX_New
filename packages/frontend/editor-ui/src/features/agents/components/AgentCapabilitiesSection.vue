@@ -4,7 +4,11 @@ import { AI_MCP_TOOL_NODE_TYPE } from '@/app/constants/nodeTypes';
 import { useToast } from '@n8n/composables/useToast';
 import { useNodeTypesStore } from '@/app/stores/nodeTypes.store';
 import { useUIStore } from '@/app/stores/ui.store';
-import type { AgentConfigValidationIssue, AgentJsonTaskConfig } from '@n8n/api-types';
+import type {
+	AgentConfigValidationIssue,
+	AgentJsonTaskConfig,
+	NodeTypeAvailabilityScope,
+} from '@n8n/api-types';
 import {
 	N8nDropdownMenu,
 	N8nDropdownMenuItem,
@@ -24,7 +28,7 @@ import { useAgentCapabilityIssueMessages } from '../composables/useAgentCapabili
 import { toolRefToNode } from '../composables/useAgentToolRefAdapter';
 import { AGENT_SUB_AGENTS_MODAL_KEY } from '../constants';
 import { formatToolNameForDisplay } from '../utils/toolDisplayName';
-import { isWarningIssue } from '../utils/validationIssues';
+import { isRestrictedIssue, isWarningIssue, restrictionScope } from '../utils/validationIssues';
 import type {
 	ToolMenuItem,
 	ToolOpenTarget,
@@ -34,6 +38,11 @@ import type {
 	SingleToolRow,
 } from './AgentCapabilitiesSection.types';
 import { buildToolRows } from './AgentCapabilitiesSection.utils';
+import {
+	getNodeTypeRestriction,
+	RestrictedNodePopover,
+} from '@n8n/frontend-module-type-availability-policies';
+
 import AgentChipButton from './AgentChipButton.vue';
 import AgentChipRow from './AgentChipRow.vue';
 import AgentItemContextMenu from './AgentItemContextMenu.vue';
@@ -157,6 +166,59 @@ const mcpServerIssueMessages = computed(() =>
 const subAgentIssueMessages = computed(() =>
 	groupIssueMessages('subAgent', (issue) => issue.capability.id),
 );
+
+/**
+ * The restricted capabilities, from the validation issues: the backend reports what its own
+ * publish gate would refuse, so the reported lock and the blocked Publish agree. Tools key on
+ * their position, MCP servers on their name.
+ *
+ * The issues go empty while an edit is unsaved, because the builder drops the stale result. The
+ * store verdict covers that window, so a lock does not blink off mid-edit — see `toolRestriction`.
+ */
+const restrictedTools = computed(() => {
+	const scopes = new Map<number, NodeTypeAvailabilityScope | undefined>();
+	for (const issue of props.validationIssues) {
+		if (!isRestrictedIssue(issue) || issue.capability.kind !== 'tool') continue;
+		if (issue.capability.index === undefined) continue;
+		scopes.set(issue.capability.index, restrictionScope(issue));
+	}
+	return scopes;
+});
+const restrictedMcpServers = computed(() => {
+	const scopes = new Map<string, NodeTypeAvailabilityScope | undefined>();
+	for (const issue of props.validationIssues) {
+		if (!isRestrictedIssue(issue) || issue.capability.kind !== 'mcpServer') continue;
+		if (issue.capability.id === undefined) continue;
+		scopes.set(issue.capability.id, restrictionScope(issue));
+	}
+	return scopes;
+});
+
+/** The project's own verdict, which an unsaved edit cannot invalidate. */
+function storedRestriction(entry: CapabilityToolEntry): NodeTypeAvailabilityScope | null {
+	const nodeType = toolNodeType(entry);
+	if (!nodeType) return null;
+	return getNodeTypeRestriction(nodeType.name)?.scope ?? null;
+}
+
+function toolRestriction(entry: CapabilityToolEntry): {
+	restricted: boolean;
+	scope: NodeTypeAvailabilityScope | undefined;
+} {
+	// A reported issue wins: it carries the scope the publish gate itself decided on.
+	if (entry.kind === 'mcpServer') {
+		if (restrictedMcpServers.value.has(entry.server.name)) {
+			return { restricted: true, scope: restrictedMcpServers.value.get(entry.server.name) };
+		}
+	} else if (restrictedTools.value.has(entry.index)) {
+		return { restricted: true, scope: restrictedTools.value.get(entry.index) };
+	}
+
+	const stored = storedRestriction(entry);
+	return stored === null
+		? { restricted: false, scope: undefined }
+		: { restricted: true, scope: stored };
+}
 
 async function ensureSubAgentNamesLoaded() {
 	const agents = await ensureProjectAgentsLoaded();
@@ -290,6 +352,7 @@ function buildCapabilityToolRows(entries: CapabilityToolEntry[]): ToolRow[] {
 				entry.kind === 'tool' && entry.tool.enabled !== false
 					? (toolWarningMessages.value.get(entry.index) ?? [])
 					: [];
+			const restriction = toolRestriction(entry);
 			return {
 				index: entry.index,
 				enabled: entry.kind === 'mcpServer' || entry.tool.enabled !== false,
@@ -303,6 +366,9 @@ function buildCapabilityToolRows(entries: CapabilityToolEntry[]): ToolRow[] {
 				invalidReasons: reasons,
 				warning: warningReasons.length > 0,
 				warningReasons,
+				restricted: restriction.restricted,
+				restrictedScope: restriction.scope,
+				restrictedTypeLabel: toolTypeLabel(entry, nodeType),
 			};
 		}),
 	);
@@ -381,6 +447,9 @@ function toolMenuItems(tool: ToolRow): ToolMenuItem[] {
 			openTarget: item.openTarget,
 			invalid: item.invalid,
 			invalidReasons: item.invalidReasons,
+			restricted: item.restricted,
+			restrictedScope: item.restrictedScope,
+			restrictedTypeLabel: item.restrictedTypeLabel,
 		},
 	}));
 }
@@ -545,6 +614,9 @@ function openExistingSubAgentModal(subAgent: {
 										:invalid-reasons="tool.invalidReasons"
 										:warning="tool.warning"
 										:warning-reasons="tool.warningReasons"
+										:restricted="tool.restricted"
+										:restricted-scope="tool.restrictedScope"
+										:restricted-type-label="tool.restrictedTypeLabel"
 										:disabled="props.disabled"
 										:class="$style.capabilityChip"
 										data-testid="agent-capabilities-tool-row"
@@ -587,6 +659,13 @@ function openExistingSubAgentModal(subAgent: {
 													:text="i18n.baseText('agents.builder.capabilities.deactivated')"
 													:clickable="false"
 												/>
+												<RestrictedNodePopover
+													v-else-if="item.data?.restricted"
+													:node-type-name="item.data.restrictedTypeLabel"
+													:scope="item.data.restrictedScope"
+													side="left"
+													marker-size="xsmall"
+												/>
 												<N8nTooltip
 													v-else-if="item.data?.invalid"
 													:disabled="(item.data.invalidReasons ?? []).length === 0"
@@ -627,6 +706,9 @@ function openExistingSubAgentModal(subAgent: {
 								:invalid-reasons="tool.invalidReasons"
 								:warning="tool.warning"
 								:warning-reasons="tool.warningReasons"
+								:restricted="tool.restricted"
+								:restricted-scope="tool.restrictedScope"
+								:restricted-type-label="tool.restrictedTypeLabel"
 								:disabled="props.disabled"
 								:class="$style.capabilityChip"
 								data-testid="agent-capabilities-tool-row"
@@ -645,6 +727,9 @@ function openExistingSubAgentModal(subAgent: {
 								:invalid-reasons="tool.invalidReasons"
 								:warning="tool.warning"
 								:warning-reasons="tool.warningReasons"
+								:restricted="tool.restricted"
+								:restricted-scope="tool.restrictedScope"
+								:restricted-type-label="tool.restrictedTypeLabel"
 								:disabled="props.disabled"
 								:class="$style.capabilityChip"
 								data-testid="agent-capabilities-tool-row"
