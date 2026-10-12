@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import {
 	N8nDialog,
+	N8nDialogBody,
 	N8nButton,
 	N8nDialogFooter,
 	N8nDialogHeader,
@@ -13,7 +14,8 @@ import {
 } from '@n8n/design-system';
 import { useI18n } from '@n8n/i18n';
 import { FocusScope } from 'reka-ui';
-import { computed, nextTick, provide, ref, useSlots, useTemplateRef } from 'vue';
+import { computed, provide, ref, useSlots, useTemplateRef } from 'vue';
+import type { ComponentPublicInstance } from 'vue';
 import { ParameterInputModalContextKey } from '@/app/constants/injectionKeys';
 
 const props = withDefaults(
@@ -62,7 +64,12 @@ const emit = defineEmits<{
 
 const slots = useSlots();
 const i18n = useI18n();
-const body = useTemplateRef<HTMLElement>('body');
+const bodyRoot = useTemplateRef<ComponentPublicInstance>('bodyRoot');
+
+function bodyElement(): HTMLElement | null {
+	const element = bodyRoot.value?.$el;
+	return element instanceof HTMLElement ? element : null;
+}
 const parameterDialogs = ref(new Set<string>());
 provide(ParameterInputModalContextKey, { openDialogs: parameterDialogs, appendTo: 'body' });
 const trapFocus = computed(() => props.trapFocus && parameterDialogs.value.size === 0);
@@ -88,24 +95,14 @@ function onBack() {
 
 function onEscapeKeyDown(event: KeyboardEvent) {
 	const isOutsideDialog =
-		event.target instanceof Node && !body.value?.closest('[role="dialog"]')?.contains(event.target);
+		event.target instanceof Node &&
+		!bodyElement()?.closest('[role="dialog"]')?.contains(event.target);
 	if (dismissalBlocked.value || isOutsideDialog) event.preventDefault();
 }
 
 function onInteractOutside(event: Event) {
 	if (dismissalBlocked.value) event.preventDefault();
 	emit('interactOutside', event);
-}
-
-function onOpenAutoFocus(event: Event) {
-	const autofocusTarget =
-		body.value?.querySelector<HTMLElement>(
-			'[data-agent-modal-autofocus], input:not([type="hidden"]):not([disabled]):not([tabindex="-1"]), textarea:not([disabled]), select:not([disabled]), [contenteditable="true"]',
-		) ?? body.value?.querySelector<HTMLElement>('button:not([disabled])');
-	if (!autofocusTarget) return;
-
-	event.preventDefault();
-	void nextTick(() => autofocusTarget.focus());
 }
 </script>
 
@@ -118,10 +115,10 @@ function onOpenAutoFocus(event: Event) {
 		:disable-outside-pointer-events="
 			props.disableOutsidePointerEvents && parameterDialogs.size === 0
 		"
-		:show-close-button="false"
+		:show-close-button="!dismissalBlocked"
+		:container-class="$style.dialog"
 		@escape-key-down="onEscapeKeyDown"
 		@interact-outside="onInteractOutside"
-		@open-auto-focus="onOpenAutoFocus"
 		@update:open="onOpenChange"
 	>
 		<N8nDialogHeader :class="$style.header">
@@ -164,17 +161,6 @@ function onOpenAutoFocus(event: Event) {
 				<div v-if="$slots.headerActions" :class="$style.headerActions">
 					<slot name="headerActions" />
 				</div>
-
-				<N8nIconButton
-					icon="x"
-					variant="ghost"
-					size="small"
-					:disabled="dismissalBlocked"
-					:aria-label="i18n.baseText('generic.close')"
-					data-testid="dialog-close-button"
-					:class="$style.closeButton"
-					@click="close"
-				/>
 			</div>
 			<N8nText
 				v-if="props.titleError"
@@ -186,21 +172,17 @@ function onOpenAutoFocus(event: Event) {
 			</N8nText>
 		</N8nDialogHeader>
 
-		<FocusScope v-if="!trapFocus" as-child @mount-auto-focus.prevent @unmount-auto-focus.prevent>
-			<span hidden aria-hidden="true" />
-		</FocusScope>
-
-		<div
-			ref="body"
-			:class="[
-				$style.body,
-				!props.bodyScrollable && $style.bodyNotScrollable,
-				props.bodyFlush && $style.bodyFlush,
-			]"
+		<N8nDialogBody
+			ref="bodyRoot"
+			:data-flush="props.bodyFlush ? 'true' : undefined"
+			:data-scrollable="props.bodyScrollable ? 'true' : 'false'"
 			data-testid="agent-modal-body"
 		>
+			<FocusScope v-if="!trapFocus" as-child @mount-auto-focus.prevent @unmount-auto-focus.prevent>
+				<span hidden aria-hidden="true" />
+			</FocusScope>
 			<slot />
-		</div>
+		</N8nDialogBody>
 
 		<N8nDialogFooter v-if="hasFooter" :class="$style.footer">
 			<slot name="footer">
@@ -230,12 +212,31 @@ function onOpenAutoFocus(event: Event) {
 <style module lang="scss">
 @use '@n8n/design-system/css/mixins/mixins' as scrollbar-mixins;
 
+.dialog {
+	/* Picker lists read these so their scrollbar can sit on the dialog edge. */
+	--agent-modal-body--padding-inline: var(--spacing--lg);
+	--agent-modal-body--padding-block-end: var(--spacing--md);
+}
+
+.dialog.dialog {
+	--n8n-dialog-region--padding: 0;
+	/* The dialog content rule sets these from its own padding. Match the header inset instead. */
+	--n8n-dialog-close--inset-block-start: calc(
+		var(--spacing--md) + (var(--n8n-dialog-title--line) - var(--n8n-dialog-close--size)) / 2
+	);
+	--n8n-dialog-close--inset-inline-end: var(--spacing--lg);
+}
+
 .header {
 	display: flex;
 	flex-direction: column;
-	margin: calc(var(--spacing--lg) * -1) calc(var(--spacing--lg) * -1) 0;
 	padding: var(--spacing--md) var(--spacing--lg);
-	border-bottom: var(--border);
+}
+
+.header.header {
+	padding-inline-end: calc(
+		var(--spacing--lg) + var(--n8n-dialog-close--size, var(--spacing--lg)) + var(--spacing--xs)
+	);
 }
 
 .titleError {
@@ -253,8 +254,7 @@ function onOpenAutoFocus(event: Event) {
 	min-width: 0;
 }
 
-.backButton,
-.closeButton {
+.backButton {
 	flex-shrink: 0;
 }
 
@@ -264,10 +264,6 @@ function onOpenAutoFocus(event: Event) {
 	gap: var(--spacing--xs);
 	min-width: 0;
 	flex: 1;
-	font-size: var(--font-size--lg);
-	font-weight: var(--font-weight--medium);
-	line-height: var(--line-height--lg);
-	color: light-dark(var(--color--neutral-900), var(--color--neutral-100));
 
 	&:hover .editIcon,
 	&:focus-within .editIcon {
@@ -302,33 +298,40 @@ function onOpenAutoFocus(event: Event) {
 	margin-left: auto;
 }
 
-.headerActions + .closeButton,
-.titleGroup + .closeButton {
-	margin-left: auto;
+.footer {
+	padding: var(--spacing--md) var(--spacing--lg);
 }
 
-.body {
+/* One body. The design-system body is the scroll owner. Header bottom padding is the space above it. */
+.dialog :global([data-slot='dialog-body']) {
 	box-sizing: border-box;
 	min-height: 0;
 	max-height: min(70dvh, calc(var(--height--5xl) * 6));
 	overflow-y: auto;
-	margin-inline: calc(var(--spacing--5xs) * -1);
-	padding: var(--spacing--md) var(--spacing--5xs) var(--spacing--5xs);
+	padding: 0 var(--agent-modal-body--padding-inline) var(--agent-modal-body--padding-block-end);
 
 	@include scrollbar-mixins.scroll-bar;
 }
 
-.body :global(.n8n-markdown) {
-	@include scrollbar-mixins.scroll-bar;
+.dialog:global(:has([data-slot='dialog-footer'])) {
+	--agent-modal-body--padding-block-end: 0;
 }
 
-.bodyNotScrollable {
-	overflow-y: hidden;
+.dialog:global(:has([data-slot='dialog-footer'])) :global([data-slot='dialog-body']) {
+	padding-block-end: 0;
 }
 
-.bodyFlush {
-	margin-inline: calc(var(--spacing--lg) * -1);
+.dialog:global(:has([data-slot='dialog-body'][data-flush='true']))
+	:global([data-slot='dialog-body']) {
 	padding: 0;
+}
+
+.dialog :global([data-slot='dialog-body'][data-scrollable='false']) {
+	overflow: hidden;
+}
+
+.dialog :global([data-slot='dialog-body'] .n8n-markdown) {
+	@include scrollbar-mixins.scroll-bar;
 }
 
 .footerLayout {
@@ -351,7 +354,22 @@ function onOpenAutoFocus(event: Event) {
 }
 
 @media (max-width: 480px) {
-	.header {
+	.dialog {
+		--agent-modal-body--padding-inline: var(--spacing--md);
+	}
+
+	.dialog.dialog {
+		--n8n-dialog-close--inset-inline-end: var(--spacing--md);
+	}
+
+	.header.header {
+		padding-inline-start: var(--spacing--md);
+		padding-inline-end: calc(
+			var(--spacing--md) + var(--n8n-dialog-close--size, var(--spacing--lg)) + var(--spacing--xs)
+		);
+	}
+
+	.footer {
 		padding-inline: var(--spacing--md);
 	}
 
