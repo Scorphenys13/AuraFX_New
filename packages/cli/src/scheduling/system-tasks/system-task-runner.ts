@@ -117,14 +117,14 @@ export class SystemTaskRunner {
 		this.metadata.subscribe((taskClass) => this.route(taskClass));
 
 		if (isMain) {
-			if (this.instanceSettings.isLeader) {
-				this.startLeaderTimers();
-			}
-
 			for (const task of this.durableTasks) {
 				await this.jobRegistrar.provision(task);
 			}
 			await this.jobRegistrar.removeStale();
+
+			if (this.instanceSettings.isLeader) {
+				this.startLeaderTimers();
+			}
 		}
 	}
 

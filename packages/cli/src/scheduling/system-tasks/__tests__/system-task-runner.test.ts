@@ -728,6 +728,25 @@ describe('SystemTaskRunner', () => {
 			expect(provisioned).toBeLessThan(removed);
 		});
 
+		it('starts the leader timers only once the stale jobs are removed', async () => {
+			const { runner, jobRegistrar } = setup(durably);
+			let finishRemoval = (): void => {};
+			jobRegistrar.removeStale.mockReturnValue(
+				new Promise<void>((resolve) => {
+					finishRemoval = resolve;
+				}),
+			);
+			const started = vi.spyOn(runner, 'startLeaderTimers');
+
+			const initializing = initRunner(runner);
+			await vi.advanceTimersByTimeAsync(0);
+			expect(started).not.toHaveBeenCalled();
+
+			finishRemoval();
+			await initializing;
+			expect(started).toHaveBeenCalledOnce();
+		});
+
 		it.each([
 			{
 				case: 'the durable scheduler is inactive',
