@@ -23,6 +23,7 @@ import { z } from 'zod';
 
 import type { InboxSourceQuery } from '../../inbox/inbox-source.registry';
 import { WorkflowSuggestionActionsService } from '../workflow-suggestions/workflow-suggestion-actions.service';
+import { WorkflowSuggestionRepository } from '../workflow-suggestions/database/workflow-suggestion.repository';
 import {
 	WorkflowSuggestionService,
 	type PreparedWorkflowSuggestion,
@@ -30,6 +31,7 @@ import {
 import type { SelfHealingResult } from './database/self-healing-result.entity';
 import { SelfHealingResultRepository } from './database/self-healing-result.repository';
 import { SelfHealingExecutionReferenceService } from './self-healing-execution-reference.service';
+import { SelfHealingChatService } from './self-healing-chat.service';
 
 const referenceSchema = z.object({
 	workflowId: z.string().min(1).max(36),
@@ -52,10 +54,13 @@ export type CompleteSelfHealingResult = SelfHealingResultContent & {
 };
 
 export function getSelfHealingReviewState(
-	result: Pick<SelfHealingResult, 'dismissedAt'>,
+	result: Pick<SelfHealingResult, 'dismissedAt' | 'continuedAt'>,
 	suggestion: Pick<WorkflowSuggestionProposalDetail, 'closedReason'> | null,
 ): SelfHealingResultDetail['reviewState'] {
-	return result.dismissedAt ? 'dismissed' : (suggestion?.closedReason ?? 'open');
+	if (suggestion?.closedReason === 'applied') return 'applied';
+	if (result.dismissedAt) return 'dismissed';
+	if (suggestion?.closedReason) return suggestion.closedReason;
+	return result.continuedAt ? 'continued' : 'open';
 }
 
 @Service()
@@ -69,6 +74,8 @@ export class SelfHealingResultService {
 		private readonly txRunner: TransactionRunner,
 		private readonly users: UserRepository,
 		private readonly roles: RoleService,
+		private readonly proposalRecords: WorkflowSuggestionRepository,
+		private readonly chat: SelfHealingChatService,
 	) {}
 
 	private async getInboxAccess(userId: string) {
@@ -186,14 +193,15 @@ export class SelfHealingResultService {
 			workflowId,
 			result.executionId,
 		);
-		return this.toDetail(result, suggestion, execution);
+		return await this.toDetail(result, suggestion, execution, reviewer.id);
 	}
 
-	private toDetail(
+	private async toDetail(
 		result: SelfHealingResult,
 		suggestion: WorkflowSuggestionProposalDetail | null,
 		execution: SelfHealingExecutionReference,
-	): SelfHealingResultDetail {
+		viewerId: string,
+	): Promise<SelfHealingResultDetail> {
 		return {
 			resultId: result.id,
 			workflowId: result.workflowId,
@@ -208,6 +216,9 @@ export class SelfHealingResultService {
 			completedAt: result.completedAt.toISOString(),
 			dismissedAt: result.dismissedAt?.toISOString() ?? null,
 			dismissedById: result.dismissedById,
+			continuedAt: result.continuedAt?.toISOString() ?? null,
+			continuedById: result.continuedById,
+			chatThreadId: await this.chat.findThreadId(result.id, viewerId),
 			reviewState: getSelfHealingReviewState(result, suggestion),
 			suggestion,
 			execution,
@@ -228,28 +239,80 @@ export class SelfHealingResultService {
 			workflowId,
 			resultId,
 		);
-		if (result.outcome !== 'fix_ready' || !result.suggestionId) {
-			throw new ConflictError("This fix isn't ready to apply. Review the report for next steps.");
-		}
-		const { publishError, ...suggestion } =
-			action === 'approve-and-publish'
-				? await this.actions.approveAndPublish(
+		let publishError: string | undefined;
+		if (action === 'approve-and-publish') {
+			if (!result.suggestionId || result.outcome !== 'fix_ready') {
+				throw new ConflictError("This fix isn't ready to apply. Review the report for next steps.");
+			}
+			({ publishError } = await this.actions.approveAndPublish(
+				reviewer,
+				projectId,
+				workflowId,
+				result.suggestionId,
+				clientId,
+			));
+		} else if (result.suggestionId && !result.dismissedAt) {
+			const proposal = await this.proposalRecords.getSuggestion(result.suggestionId, {
+				workflowId,
+				projectId,
+			});
+			if (proposal.state === 'pending') {
+				let applied: WorkflowSuggestionProposalDetail;
+				try {
+					applied = await this.actions.apply(
 						reviewer,
 						projectId,
 						workflowId,
-						result.suggestionId,
+						proposal.id,
 						clientId,
-					)
-				: await this.actions.apply(reviewer, projectId, workflowId, result.suggestionId, clientId);
-		const execution = await this.executionReferences.getReference(
-			reviewer,
-			workflowId,
-			result.executionId,
-		);
+					);
+				} catch (error) {
+					if (!(error instanceof ConflictError)) throw error;
+					applied = await this.suggestions.getProposal(
+						reviewer,
+						projectId,
+						workflowId,
+						proposal.id,
+					);
+					if (applied.closedReason !== 'applied') throw error;
+				}
+				if (applied.closedReason !== 'applied') {
+					throw new ConflictError(
+						'The suggestion is no longer available to apply. Refresh the result.',
+					);
+				}
+			}
+		} else if (!result.suggestionId) {
+			await this.requireCurrentProject(workflowId, projectId);
+			await this.results.recordContinuation(resultId, reviewer.id, {});
+		}
 		return {
-			...this.toDetail(result, suggestion, execution),
+			...(await this.getDetail(reviewer, projectId, workflowId, resultId)),
 			...(publishError !== undefined ? { publishError } : {}),
 		};
+	}
+
+	async prepareChat(
+		user: User,
+		projectId: string,
+		workflowId: string,
+		resultId: string,
+		clientId?: string,
+	): Promise<SelfHealingResultDetail> {
+		const reviewer = await this.suggestions.requireEditor(user.id, workflowId);
+		await this.chat.assertAvailable(reviewer);
+		const detail = await this.act(reviewer, projectId, workflowId, resultId, 'apply', clientId);
+		await this.txRunner.run({}, async (ctx) => {
+			const result = await this.results.lockForContinuation(
+				resultId,
+				{ projectId, workflowId },
+				ctx,
+			);
+			const actor = await this.suggestions.requireEditor(reviewer.id, workflowId, ctx);
+			await this.requireCurrentProject(workflowId, projectId, ctx);
+			await this.chat.prepare(actor, result, ctx, detail.execution);
+		});
+		return await this.getDetail(reviewer, projectId, workflowId, resultId);
 	}
 
 	async dismiss(user: User, projectId: string, workflowId: string, resultId: string) {
@@ -261,7 +324,7 @@ export class SelfHealingResultService {
 				resultId,
 				ctx,
 			);
-			if (result.dismissedAt) return true;
+			if (result.dismissedAt || result.continuedAt) return true;
 			if (result.suggestionId) {
 				const outcome = await this.actions.discardPending(
 					reviewer,

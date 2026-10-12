@@ -18,11 +18,11 @@ in the Assistant run history and do not create a report or suggestion.
 The investigation instructions must keep sensitive values out of reports, summaries, and
 suggestion explanations and error context. Persistence does not scrub these fields.
 
-| Outcome         | Suggestion | Actions                                      |
-| --------------- | ---------- | -------------------------------------------- |
-| `fix_ready`     | Required   | Approve and publish, Open in editor, Discard |
-| `needs_you`     | Optional   | Continue in chat, Dismiss                    |
-| `could_not_fix` | None       | Continue in chat, Dismiss                    |
+| Outcome | Suggestion | Actions |
+| --- | --- | --- |
+| `fix_ready` | Required | Approve and publish, Apply and open in editor/chat, Discard |
+| `needs_you` | Optional | Apply and open in editor/chat when changes exist; otherwise Open in editor/chat, Dismiss |
+| `could_not_fix` | None | Open in editor/chat, Dismiss |
 
 The report is one string. Usage contains `credits`, `turns`, `durationSeconds`, `promptTokens`,
 `completionTokens`, and `totalTokens`. The usage object and all measurement fields are required;
@@ -46,12 +46,14 @@ Routes use `/projects/:projectId/workflows/:workflowId/self-healing-results`:
 - `POST /:resultId/approve-and-publish`
 - `POST /:resultId/apply`
 - `POST /:resultId/dismiss`
+- `POST /:resultId/chat`
 
 Current workflow editors can review results. Approval also requires publish access.
 Each action resolves its suggestion from the result and returns the updated review.
 Send the editor client ID in `push-ref` for Apply actions.
 Read the returned review state before navigating. A competing action can close the suggestion first.
-Apply saves the proposed fix without publishing; the UI opens the editor when `reviewState` is `applied`.
+Apply saves ready or partial suggested changes to the workflow draft without publishing.
+Approve and publish accepts only `fix_ready` suggestions.
 Detail reads do not change suggestion state. Workflow events reconcile stale suggestions, and actions
 check the current workflow before writing. If Apply fails, keep the review open and show the error.
 
@@ -64,24 +66,38 @@ returns an error. `publishError` describes that request only. The response inclu
 ID and the suggestion's recorded applied version. Open the normal editor for publication status
 and recovery. Repeating a review action does not save or publish again.
 
-For Continue in chat, fetch the result detail again to check current access.
-Pass `report` to the normal Assistant handoff. Build a workflow attachment from `workflowId`.
-Include `execution.id` only when `execution.status` is `available`.
-Offer this action for `needs_you` and `could_not_fix` results.
-The normal handoff opens a new chat in the clicking user's personal project.
-Normal chat ownership and tool permissions apply. Do not copy the background conversation or grants.
+The editor uses Apply. The chat endpoint calls the same Apply action before it creates or opens
+a private chat. Apply saves pending ready or partial changes through the existing suggestion
+service. It keeps the existing transaction and version receipt. For a report without a suggestion,
+Apply records `continuedAt` and `continuedById` once. Both actions close the result without
+publishing. Applied results retain their Applied state. Already dismissed, discarded, or outdated
+results retain their existing closure. Navigation errors do not reopen the result.
+
+Each reviewer has one private chat per result in their personal project. The server-owned
+`instance_ai_threads.selfHealingResultId` field and reviewer ID identify that chat. The detail's
+`chatThreadId` always identifies the caller's chat, or is null if the caller has no chat.
+A transaction serializes chat creation and saves the report once. The workflow attachment includes
+the execution ID only when the reviewer can read it. Repeated requests reuse the saved chat.
+If chat creation fails after Apply, the draft and closure stay saved. An explicit retry can create
+the chat without applying the changes again.
+
+Opening a saved chat does not start an Assistant run or send a follow-up prompt. Normal chat owns
+later messages and run errors. Normal ownership and tool permissions apply. The background
+conversation and grants stay separate. Deleting a chat does not reopen the result.
 
 ## Availability
 
 Set `N8N_INSTANCE_AI_WORKFLOW_SUGGESTIONS_ENABLED=true` before startup to load review routes.
 The `instance-ai` module must be loaded. Entities and migrations do not depend on this rollout flag.
 The rollout flag is separate from the future switch for new investigations. Saved review services
-do not check investigation enablement or Assistant model availability.
+do not check investigation enablement. Chat checks Assistant access and enablement before applying changes.
+Model setup belongs to normal chat.
 
 The shared Inbox reads result rows through `SelfHealingResultService.listForInbox()`.
 It reads counts through `countForInbox()`. Both use current editor access and original-project ownership.
 The source selects rows before applying the shared pagination boundary and limit.
 The shared API uses `GET /inbox` and `GET /inbox/summary`.
-Open and Closed derive from result dismissal and suggestion closure. Inbox reads do not change either state.
-The review UI will provide review screens and chat and editor navigation.
+Open and Closed derive from result continuation, dismissal, and suggestion closure.
+Inbox reads do not change these states.
+The review UI provides review screens and chat and editor navigation.
 The investigation producer will run investigations and submit completed results.
