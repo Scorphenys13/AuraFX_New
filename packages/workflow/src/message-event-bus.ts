@@ -57,6 +57,42 @@ export interface IAbstractEventMessage {
 // Event Destination Zod Schemas
 // ===============================
 
+const ipv4Schema = z.string().ip({ version: 'v4' });
+const ipv6Schema = z.string().ip({ version: 'v6' });
+
+const isValidHostname = (value: string) => {
+	const hostname = value.replace(/\.$/, '');
+	if (hostname.length > 253 || !/[a-z]/i.test(hostname)) return false;
+
+	return hostname
+		.split('.')
+		.every(
+			(label) =>
+				label.length > 0 && label.length <= 63 && /^[a-z\d](?:[a-z\d-]*[a-z\d])?$/i.test(label),
+		);
+};
+
+const isValidHost = (value: string) =>
+	isValidHostname(value) ||
+	ipv4Schema.safeParse(value).success ||
+	ipv6Schema.safeParse(value).success;
+
+const destinationUrlSchema = z
+	.string()
+	.url()
+	.refine((value) => {
+		try {
+			const { hostname, protocol } = new URL(value);
+			return (
+				['http:', 'https:'].includes(protocol) && isValidHost(hostname.replace(/^\[|\]$/g, ''))
+			);
+		} catch {
+			return false;
+		}
+	}, 'Invalid URL');
+
+const syslogHostSchema = z.string().min(1).refine(isValidHost, 'Invalid host');
+
 // Circuit Breaker Options Schema
 export const circuitBreakerSchema = z
 	.object({
@@ -152,7 +188,7 @@ export const MessageEventBusDestinationOptionsSchema = z.object({
 export const MessageEventBusDestinationWebhookOptionsSchema =
 	MessageEventBusDestinationOptionsSchema.extend({
 		__type: z.literal('$$MessageEventBusDestinationWebhook'),
-		url: z.string().url(),
+		url: destinationUrlSchema,
 		responseCodeMustMatch: z.boolean().optional(),
 		expectedStatusCode: z.number().int().optional(),
 		method: z.string().optional(),
@@ -177,7 +213,7 @@ export const MessageEventBusDestinationWebhookOptionsSchema =
 export const MessageEventBusDestinationSentryOptionsSchema =
 	MessageEventBusDestinationOptionsSchema.extend({
 		__type: z.literal('$$MessageEventBusDestinationSentry'),
-		dsn: z.string().url(),
+		dsn: destinationUrlSchema,
 		tracesSampleRate: z.number().min(0).max(1).optional(),
 		sendPayload: z.boolean().optional(),
 	});
@@ -187,7 +223,7 @@ export const MessageEventBusDestinationSyslogOptionsSchema =
 	MessageEventBusDestinationOptionsSchema.extend({
 		__type: z.literal('$$MessageEventBusDestinationSyslog'),
 		expectedStatusCode: z.number().int().optional(),
-		host: z.string().min(1),
+		host: syslogHostSchema,
 		port: z.number().int().positive().optional(),
 		protocol: z.enum(['udp', 'tcp', 'tls']).optional(),
 		facility: z.number().int().min(0).max(23).optional(),
