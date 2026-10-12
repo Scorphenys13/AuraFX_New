@@ -5,6 +5,7 @@ import {
 	BINARY_OPS,
 	CALLABLE_METHODS,
 	DATA_ROOTS,
+	EXTENSION_METHODS,
 	ITERATOR_METHODS,
 	LEGACY_NODE_REF_MEMBERS,
 	MAX_DEPTH,
@@ -226,6 +227,8 @@ function parseCall(
 ): SimpleNode | null {
 	const callee = node.callee;
 	if (callee.type !== 'MemberExpression' || callee.computed === true) return null;
+	// The callee is read here, not re-parsed, so its comments are checked here.
+	if (callee.comments?.length) return null;
 
 	const property = callee.property;
 	if (property.type !== 'Identifier') return null;
@@ -244,7 +247,7 @@ function parseCall(
 
 	const method = property.name;
 	const isIterator = isOneOf(ITERATOR_METHODS, method);
-	if (!isIterator && !CALLABLE_METHODS.has(method)) return null;
+	if (!isIterator && !CALLABLE_METHODS.has(method) && !EXTENSION_METHODS.has(method)) return null;
 
 	const receiver = parse(callee.object);
 	if (receiver === null) return null;
@@ -279,6 +282,59 @@ function parseChain(node: namedTypes.ChainExpression, parse: ParseChild): Simple
 	if (expression === null) return null;
 
 	return { kind: 'chain', expression };
+}
+
+/**
+ * Once a chunk holds an extension call, extendTransform rewrites every
+ * optional chain in it through its own polyfill, and that reprint drops the
+ * parentheses around a `??` operand mixed with `&&` or `||`: the engines
+ * then throw "invalid syntax" where this interpreter would evaluate. A
+ * chunk with both an optional chain and an extension call is theirs. The
+ * rewrite matches by method name alone, so a node-ref call like
+ * `$input.first()` counts too.
+ */
+export function usesPolyfilledChain(root: SimpleNode): boolean {
+	let chain = false;
+	let extension = false;
+	const visit = (node: SimpleNode): void => {
+		switch (node.kind) {
+			case 'chain':
+				chain = true;
+				visit(node.expression);
+				return;
+			case 'call':
+				if (EXTENSION_METHODS.has(node.method)) {
+					extension = true;
+				}
+				visit(node.receiver);
+				node.args.forEach(visit);
+				return;
+			case 'iterate':
+				visit(node.receiver);
+				visit(node.body);
+				return;
+			case 'member':
+				visit(node.object);
+				return;
+			case 'unary':
+				visit(node.argument);
+				return;
+			case 'binary':
+			case 'logical':
+				visit(node.left);
+				visit(node.right);
+				return;
+			case 'conditional':
+				visit(node.test);
+				visit(node.consequent);
+				visit(node.alternate);
+				return;
+			default:
+				return;
+		}
+	};
+	visit(root);
+	return chain && extension;
 }
 
 function parseBranches(
@@ -331,6 +387,10 @@ export function parseSimple(
 	param: string | null = null,
 ): SimpleNode | null {
 	if (depth > MAX_DEPTH) return null;
+	// extendSyntax finds extension calls by regex over the source text, and a
+	// comment between the name and the parentheses hides one from it. The
+	// parser attaches comments to the nearest node; any comment declines.
+	if (node.comments?.length) return null;
 	const parse: ParseChild = (child, childParam = param) =>
 		parseSimple(child, depth + 1, childParam);
 

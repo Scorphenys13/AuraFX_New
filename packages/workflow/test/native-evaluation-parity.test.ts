@@ -47,7 +47,7 @@ describe('Expression - fast native evaluation parity', () => {
 				parameters: {
 					value1: 'hello',
 					value2: '={{ $json.item.name }}',
-					value3: '={{ $json.item.names.first() }}',
+					value3: '={{ Object.keys($json.item.names) }}',
 				},
 			},
 		],
@@ -77,6 +77,7 @@ describe('Expression - fast native evaluation parity', () => {
 				active: true,
 				disabled: false,
 				nothing: null,
+				when: '2024-01-02T03:04:05.000Z',
 				my_object: { addresses: { primary: '123 Main St' } },
 				names: ['bar', 'baz'],
 				mixed: ['a', 1],
@@ -234,6 +235,19 @@ describe('Expression - fast native evaluation parity', () => {
 	});
 
 	describe('errors match the engine', () => {
+		test('an extension error is the one extend() throws', () => {
+			const expr = '={{ $json.item.name.first() }}';
+			const capture = (native: boolean): Error => {
+				try {
+					evaluate(expr, native);
+				} catch (error) {
+					return error as Error;
+				}
+				throw new Error('expected an error');
+			};
+			expect(capture(true).message).toEqual(capture(false).message);
+		});
+
 		// No execution data for the source node: every `$json` read throws.
 		const emptyRunData = runDataFor([]);
 
@@ -297,7 +311,12 @@ describe('Expression - fast native evaluation parity', () => {
 	describe('non-JSON values and inherited members', () => {
 		const exotic = {
 			json: {
-				item: { fn: () => 1, sym: Symbol('s'), dt: DateTime.fromISO('2026-01-02T03:04:05Z') },
+				item: {
+					fn: () => 1,
+					sym: Symbol('s'),
+					dt: DateTime.fromISO('2026-01-02T03:04:05Z'),
+					names: ['bar'],
+				},
 			},
 		};
 		const exoticRunData = runDataFor([exotic as never]);
@@ -588,6 +607,12 @@ describe('Expression - fast native evaluation parity', () => {
 			const $json = { list: Object.assign(['a'], { join: null }) };
 			expect(nativeOn('{{ $json.list.join() }}', { $json })).toEqual({ handled: false });
 			expect(nativeOn('{{ $json.list.at(0) }}', { $json })).toEqual({ handled: true, value: 'a' });
+		});
+
+		// extendSyntax rewrites the call into extend() dispatch regardless.
+		test('an own property does not shadow an extension', () => {
+			const $json = { list: Object.assign(['a'], { last: null }) };
+			expect(nativeOn('{{ $json.list.last() }}', { $json })).toEqual({ handled: true, value: 'a' });
 		});
 	});
 
