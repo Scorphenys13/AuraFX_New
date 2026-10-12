@@ -17,16 +17,17 @@ describe('ExecutionPruningHardDeleteTask', () => {
 	it('should declare the configured hard-delete cadence', () => {
 		expect(task.name).toBe('execution-pruning-hard-delete');
 		expect(task.schedule).toEqual({ kind: 'interval', intervalSeconds: 900 });
-		expect(task.effects).toBe('idempotent');
-		expect(task.placement).toEqual({ scope: 'cluster', durable: true });
-		expect(task.timeoutSeconds).toBe(900);
-		expect(task.retryDelaySeconds).toBe(1);
+		expect(task.target).toEqual({
+			scope: 'cluster',
+			scheduler: { maxAttempts: 3, timeoutSeconds: 900 },
+			leaderTimer: { retryDelaySeconds: 1 },
+		});
 	});
 
 	it('should hard-delete with the run signal', async () => {
 		const { signal } = new AbortController();
 
-		await task.run(signal);
+		await task.run(signal, { runner: 'scheduler' });
 
 		expect(pruningService.hardDelete).toHaveBeenCalledWith(signal);
 	});
